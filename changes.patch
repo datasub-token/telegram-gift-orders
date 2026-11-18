@@ -1,0 +1,2116 @@
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/BUILD b/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/BUILD
+index 9eedd1221b..bc56a68feb 100644
+--- a/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/BUILD
++++ b/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/BUILD
+@@ -50,6 +50,10 @@ swift_library(
+         "//submodules/TelegramUI/Components/GlassBackgroundComponent",
+         "//submodules/TelegramUI/Components/ContextControllerImpl",
+         "//submodules/TelegramUI/Components/CheckComponent",
++        "//submodules/TelegramUI/Components/AvatarComponent",
++        "//submodules/AnimatedAvatarSetNode",
++        "//submodules/TelegramUI/Components/Stars/StarsWithdrawalScreen",
++        "//submodules/TelegramUI/Components/Stars/BalanceNeededScreen",
+     ],
+     visibility = [
+         "//visibility:public",
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/BalanceComponent.swift b/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/BalanceComponent.swift
+index c8ac352788..251b8948d3 100644
+--- a/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/BalanceComponent.swift
++++ b/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/BalanceComponent.swift
+@@ -78,13 +78,15 @@ final class BalanceComponent: Component {
+                 if let starsContext = component.context.starsContext, let tonContext = component.context.tonContext {
+                     self.balanceDisposable = combineLatest(queue: Queue.mainQueue(),
+                         starsContext.state,
+-                        tonContext.state
+-                    ).start(next: { [weak self] starsState, tonState in
++                        tonContext.state,
++                        // Buy Orders (concept): what your open orders hold is not yours to spend
++                        GiftBuyOrdersStorage.shared.heldAmounts(accountPeerId: component.context.account.peerId)
++                    ).start(next: { [weak self] starsState, tonState, held in
+                         guard let self else {
+                             return
+                         }
+-                        self.starsBalance = starsState?.balance.value ?? 0
+-                        self.tonBalance = tonState?.balance.value ?? 0
++                        self.starsBalance = max(0, (starsState?.balance.value ?? 0) - held.stars)
++                        self.tonBalance = max(0, (tonState?.balance.value ?? 0) - held.ton)
+                         if !self.isUpdating {
+                             self.componentState?.updated()
+                         }
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/GiftBuyOrders.swift b/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/GiftBuyOrders.swift
+new file mode 100644
+index 0000000000..a75c7e90ef
+--- /dev/null
++++ b/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/GiftBuyOrders.swift
+@@ -0,0 +1,360 @@
++import Foundation
++import SwiftSignalKit
++import TelegramCore
++import AccountContext
++import TelegramStringFormatting
++
++// Buy Orders (concept): standing orders to buy any gift of a collection at a set price, shown as the collection's
++// order book on its resale market. There is no server API for them yet, so the book is put together on the device:
++// a few sample buyers bidding just under the collection's cheapest listing, plus the orders you place yourself, which
++// are kept in UserDefaults for each gift type. Placing an order, cancelling it or selling to an order changes only
++// this local book: no Stars and no gifts move.
++
++enum GiftBuyOrderCondition: Equatable {
++    case any
++    case model(String)
++    case backdrop(String)
++    
++    var title: String {
++        switch self {
++        case .any:
++            return "Any model"
++        case let .model(name):
++            return "Model: \(name)"
++        case let .backdrop(name):
++            return "Backdrop: \(name)"
++        }
++    }
++    
++    func matches(_ gift: StarGift.UniqueGift) -> Bool {
++        switch self {
++        case .any:
++            return true
++        case let .model(name):
++            return gift.attributes.contains(where: { attribute in
++                if case let .model(modelName, _, _, _) = attribute {
++                    return modelName == name
++                }
++                return false
++            })
++        case let .backdrop(name):
++            return gift.attributes.contains(where: { attribute in
++                if case let .backdrop(backdropName, _, _, _, _, _, _) = attribute {
++                    return backdropName == name
++                }
++                return false
++            })
++        }
++    }
++}
++
++struct GiftBuyOrder: Equatable {
++    enum Id: Hashable {
++        case sample(Int)
++        case mine(String)
++    }
++    
++    let id: Id
++    let peer: EnginePeer
++    let amount: CurrencyAmount
++    let condition: GiftBuyOrderCondition
++    /// The order's value in Stars: orders placed in GRAM are ranked by it.
++    let rank: Int64
++    
++    var isMine: Bool {
++        if case .mine = self.id {
++            return true
++        }
++        return false
++    }
++}
++
++/// Your own orders and the sample orders you sold to, for each gift type, in UserDefaults.
++final class GiftBuyOrdersStorage {
++    static let shared = GiftBuyOrdersStorage()
++    
++    struct Order: Codable, Equatable {
++        var id: String
++        var isTon: Bool
++        var amount: Int64
++        var date: Int32
++        var duration: Int32
++    }
++    
++    struct Book: Codable, Equatable {
++        var orders: [Order] = []
++        var soldTo: [Int] = []
++    }
++    
++    private var version = 0
++    private let versionPromise = ValuePromise<Int>(0, ignoreRepeated: true)
++    
++    var updates: Signal<Int, NoError> {
++        return self.versionPromise.get()
++    }
++    
++    private func key(accountPeerId: EnginePeer.Id) -> String {
++        return "giftBuyOrders_\(accountPeerId.toInt64())"
++    }
++    
++    private func books(accountPeerId: EnginePeer.Id) -> [String: Book] {
++        guard let data = UserDefaults.standard.data(forKey: self.key(accountPeerId: accountPeerId)), let books = try? JSONDecoder().decode([String: Book].self, from: data) else {
++            return [:]
++        }
++        return books
++    }
++    
++    /// The book of one gift type, without the orders whose time has run out.
++    func book(accountPeerId: EnginePeer.Id, giftId: Int64) -> Book {
++        var book = self.books(accountPeerId: accountPeerId)["\(giftId)"] ?? Book()
++        let timestamp = Int32(Date().timeIntervalSince1970)
++        book.orders.removeAll(where: { $0.date + $0.duration <= timestamp })
++        return book
++    }
++    
++    func update(accountPeerId: EnginePeer.Id, giftId: Int64, _ f: (inout Book) -> Void) {
++        var books = self.books(accountPeerId: accountPeerId)
++        var book = books["\(giftId)"] ?? Book()
++        f(&book)
++        books["\(giftId)"] = book
++        if let data = try? JSONEncoder().encode(books) {
++            UserDefaults.standard.set(data, forKey: self.key(accountPeerId: accountPeerId))
++        }
++        self.version += 1
++        self.versionPromise.set(self.version)
++    }
++    
++    /// Stars and nanotons held by your open orders in all collections.
++    func currentHeldAmounts(accountPeerId: EnginePeer.Id) -> (stars: Int64, ton: Int64) {
++        let timestamp = Int32(Date().timeIntervalSince1970)
++        var stars: Int64 = 0
++        var ton: Int64 = 0
++        for (_, book) in self.books(accountPeerId: accountPeerId) {
++            for order in book.orders where order.date + order.duration > timestamp {
++                if order.isTon {
++                    ton += order.amount
++                } else {
++                    stars += order.amount
++                }
++            }
++        }
++        return (stars, ton)
++    }
++    
++    func heldAmounts(accountPeerId: EnginePeer.Id) -> Signal<(stars: Int64, ton: Int64), NoError> {
++        return self.updates
++        |> map { [weak self] _ -> (stars: Int64, ton: Int64) in
++            return self?.currentHeldAmounts(accountPeerId: accountPeerId) ?? (0, 0)
++        }
++    }
++}
++
++private struct GiftBuyOrdersRandom {
++    private var state: UInt64
++    
++    init(seed: Int64) {
++        self.state = UInt64(bitPattern: seed) ^ 0x9e3779b97f4a7c15
++    }
++    
++    mutating func next() -> UInt64 {
++        self.state = self.state &* 6364136223846793005 &+ 1442695040888963407
++        return self.state >> 33
++    }
++}
++
++/// The sample buyers: first and last name, and the avatar colour (the peer id modulo 7 picks it).
++private let sampleBuyers: [(firstName: String, lastName: String?, color: Int64)] = [
++    ("Arthur", "K.", 5),
++    ("Nikita", nil, 0),
++    ("Sofia", "M.", 6),
++    ("Timur", nil, 3),
++    ("Lena", nil, 1),
++    ("Gift", "Whale", 2),
++    ("Mia", "R.", 4),
++    ("Daniel", nil, 5),
++    ("Oleg", "S.", 0),
++    ("Kate", nil, 6),
++    ("Max", "T.", 3),
++    ("Eva", nil, 1)
++]
++
++/// The sample orders' prices as fractions of the cheapest listing, best first.
++private let sampleRatios: [Double] = [0.949, 0.936, 0.924, 0.890, 0.856, 0.839]
++
++private func sampleBuyerPeer(index: Int) -> EnginePeer {
++    let buyer = sampleBuyers[index]
++    let id = EnginePeer.Id(namespace: Namespaces.Peer.CloudUser, id: EnginePeer.Id.Id._internalFromInt64Value(7_000_000_000 + Int64(index) * 7 + buyer.color))
++    return .user(TelegramUser(id: id, accessHash: nil, firstName: buyer.firstName, lastName: buyer.lastName, username: nil, phone: nil, photo: [], botInfo: nil, restrictionInfo: nil, flags: [], emojiStatus: nil, usernames: [], storiesHidden: nil, nameColor: nil, backgroundEmojiId: nil, profileColor: nil, profileBackgroundEmojiId: nil, subscriberCount: nil, verificationIconFileId: nil))
++}
++
++/// The same sample book every time for a gift type: six buyers, prices just under the cheapest listing, rounded the
++/// way people round them, two of them asking for a backdrop or a model of the collection.
++private func sampleBuyOrders(giftId: Int64, cheapest: Int64, attributes: [StarGift.UniqueGift.Attribute]) -> [GiftBuyOrder] {
++    var random = GiftBuyOrdersRandom(seed: giftId)
++    let firstBuyer = Int(random.next() % UInt64(sampleBuyers.count))
++    
++    var models: [String] = []
++    var backdrops: [String] = []
++    for attribute in attributes {
++        switch attribute {
++        case let .model(name, _, _, _):
++            models.append(name)
++        case let .backdrop(name, _, _, _, _, _, _):
++            backdrops.append(name)
++        default:
++            break
++        }
++    }
++    models.sort()
++    backdrops.sort()
++    let modelIndex = Int(random.next() % UInt64(max(1, models.count)))
++    let backdropIndex = Int(random.next() % UInt64(max(1, backdrops.count)))
++    
++    let step: Int64
++    if cheapest >= 20_000 {
++        step = 500
++    } else if cheapest >= 2_000 {
++        step = 50
++    } else if cheapest >= 200 {
++        step = 5
++    } else {
++        step = 1
++    }
++    
++    var orders: [GiftBuyOrder] = []
++    var previousPrice: Int64 = cheapest
++    for i in 0 ..< sampleRatios.count {
++        var price = Int64((Double(cheapest) * sampleRatios[i] / Double(step)).rounded()) * step
++        price = max(step, min(price, previousPrice - step))
++        previousPrice = price
++        
++        var condition: GiftBuyOrderCondition = .any
++        if i == 2, !backdrops.isEmpty {
++            condition = .backdrop(backdrops[backdropIndex])
++        } else if i == 5, !models.isEmpty {
++            condition = .model(models[modelIndex])
++        }
++        
++        let buyerIndex = (firstBuyer + i) % sampleBuyers.count
++        orders.append(GiftBuyOrder(
++            id: .sample(buyerIndex),
++            peer: sampleBuyerPeer(index: buyerIndex),
++            amount: CurrencyAmount(amount: StarsAmount(value: price, nanos: 0), currency: .stars),
++            condition: condition,
++            rank: price
++        ))
++    }
++    return orders
++}
++
++/// The order book of one collection: the sample orders and yours, best first (yours first among equal ones).
++final class GiftBuyOrdersContext {
++    struct State: Equatable {
++        var orders: [GiftBuyOrder]
++    }
++    
++    let context: AccountContext
++    let gift: StarGift.Gift
++    let resaleGiftsContext: ResaleGiftsContext
++    
++    private let statePromise = Promise<State>()
++    var state: Signal<State, NoError> {
++        return self.statePromise.get()
++    }
++    
++    init(context: AccountContext, gift: StarGift.Gift, resaleGiftsContext: ResaleGiftsContext) {
++        self.context = context
++        self.gift = gift
++        self.resaleGiftsContext = resaleGiftsContext
++        
++        let giftId = gift.id
++        let accountPeerId = context.account.peerId
++        let minResaleStars = gift.availability?.minResaleStars
++        let fallbackPrice = max(gift.price * 10, 100)
++        let configuration = StarsSubscriptionConfiguration.with(appConfiguration: context.currentAppConfiguration.with { $0 })
++        
++        let accountPeer: Signal<EnginePeer?, NoError> = .single(nil)
++        |> then(context.engine.data.subscribe(TelegramEngine.EngineData.Item.Peer.Peer(id: accountPeerId)))
++        
++        // the collection's models and backdrops, and its cheapest listing while the market is not filtered
++        let listings: Signal<([StarGift.UniqueGift.Attribute], Int64?), NoError> = .single(([], nil))
++        |> then(resaleGiftsContext.state
++            |> filter { state in
++                return state.filterAttributes.isEmpty && !state.starsOnly
++            }
++            |> map { state -> ([StarGift.UniqueGift.Attribute], Int64?) in
++                var cheapest: Int64?
++                for gift in state.gifts {
++                    if case let .unique(uniqueGift) = gift, let price = uniqueGift.resellAmounts?.first(where: { $0.currency == .stars })?.amount.value {
++                        cheapest = min(cheapest ?? price, price)
++                    }
++                }
++                return (state.attributes, cheapest)
++            }
++        )
++        
++        self.statePromise.set(combineLatest(queue: Queue.mainQueue(),
++            GiftBuyOrdersStorage.shared.updates,
++            accountPeer,
++            listings
++        )
++        |> map { _, accountPeer, listings -> State in
++            let book = GiftBuyOrdersStorage.shared.book(accountPeerId: accountPeerId, giftId: giftId)
++            let cheapest = minResaleStars ?? listings.1 ?? fallbackPrice
++            
++            var orders = sampleBuyOrders(giftId: giftId, cheapest: cheapest, attributes: listings.0).filter { order in
++                if case let .sample(index) = order.id, book.soldTo.contains(index) {
++                    return false
++                }
++                return true
++            }
++            if let accountPeer {
++                for order in book.orders {
++                    let amount = CurrencyAmount(amount: StarsAmount(value: order.amount, nanos: 0), currency: order.isTon ? .ton : .stars)
++                    let rank: Int64
++                    if order.isTon {
++                        rank = convertTonToStars(amount.amount, tonUsdRate: configuration.tonUsdRate, starsUsdRate: Double(configuration.usdWithdrawRate))
++                    } else {
++                        rank = order.amount
++                    }
++                    orders.append(GiftBuyOrder(id: .mine(order.id), peer: accountPeer, amount: amount, condition: .any, rank: rank))
++                }
++            }
++            orders.sort(by: { lhs, rhs in
++                if lhs.rank != rhs.rank {
++                    return lhs.rank > rhs.rank
++                }
++                return lhs.isMine && !rhs.isMine
++            })
++            return State(orders: orders)
++        }
++        |> distinctUntilChanged)
++    }
++    
++    func placeOrder(amount: CurrencyAmount, duration: Int32) {
++        GiftBuyOrdersStorage.shared.update(accountPeerId: self.context.account.peerId, giftId: self.gift.id, { book in
++            book.orders.append(GiftBuyOrdersStorage.Order(
++                id: UUID().uuidString,
++                isTon: amount.currency == .ton,
++                amount: amount.amount.value,
++                date: Int32(Date().timeIntervalSince1970),
++                duration: duration
++            ))
++        })
++    }
++    
++    func cancelOrder(id: String) {
++        GiftBuyOrdersStorage.shared.update(accountPeerId: self.context.account.peerId, giftId: self.gift.id, { book in
++            book.orders.removeAll(where: { $0.id == id })
++        })
++    }
++    
++    /// You sold a gift to this sample buyer: their order leaves the book.
++    func markSold(sampleIndex: Int) {
++        GiftBuyOrdersStorage.shared.update(accountPeerId: self.context.account.peerId, giftId: self.gift.id, { book in
++            if !book.soldTo.contains(sampleIndex) {
++                book.soldTo.append(sampleIndex)
++            }
++        })
++    }
++}
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/GiftBuyOrdersCellComponent.swift b/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/GiftBuyOrdersCellComponent.swift
+new file mode 100644
+index 0000000000..c4ed33b37a
+--- /dev/null
++++ b/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/GiftBuyOrdersCellComponent.swift
+@@ -0,0 +1,314 @@
++import Foundation
++import UIKit
++import Display
++import ComponentFlow
++import SwiftSignalKit
++import TelegramCore
++import TelegramPresentationData
++import AccountContext
++import AppBundle
++import MultilineTextComponent
++import PlainButtonComponent
++import GiftItemComponent
++import AnimatedAvatarSetNode
++
++/// Buy Orders (concept): the first cell of a collection's resale market. A card in the grid's cell size, as white as
++/// the shop's cells: the three best buyers' avatars, "Buy Orders", how many there are, the best order in the shop's
++/// Stars price capsule and a blue corner ribbon (the grid's own `Premium/GiftRibbon`).
++final class GiftBuyOrdersCellComponent: Component {
++    let context: AccountContext
++    let theme: PresentationTheme
++    let peers: [EnginePeer]
++    let count: Int
++    let bestStars: Int64?
++    let groupingSeparator: String
++    
++    init(
++        context: AccountContext,
++        theme: PresentationTheme,
++        peers: [EnginePeer],
++        count: Int,
++        bestStars: Int64?,
++        groupingSeparator: String
++    ) {
++        self.context = context
++        self.theme = theme
++        self.peers = peers
++        self.count = count
++        self.bestStars = bestStars
++        self.groupingSeparator = groupingSeparator
++    }
++    
++    static func ==(lhs: GiftBuyOrdersCellComponent, rhs: GiftBuyOrdersCellComponent) -> Bool {
++        if lhs.context !== rhs.context {
++            return false
++        }
++        if lhs.theme !== rhs.theme {
++            return false
++        }
++        if lhs.peers != rhs.peers {
++            return false
++        }
++        if lhs.count != rhs.count {
++            return false
++        }
++        if lhs.bestStars != rhs.bestStars {
++            return false
++        }
++        if lhs.groupingSeparator != rhs.groupingSeparator {
++            return false
++        }
++        return true
++    }
++    
++    final class View: UIView {
++        private let backgroundLayer = SimpleLayer()
++        private let avatarsContext = AnimatedAvatarSetContext()
++        private let avatarsView = AnimatedAvatarSetView()
++        private let title = ComponentView<Empty>()
++        private let subtitle = ComponentView<Empty>()
++        private let price = ComponentView<Empty>()
++        private let ribbon = UIImageView()
++        private let ribbonText = ComponentView<Empty>()
++        
++        private var component: GiftBuyOrdersCellComponent?
++        
++        override init(frame: CGRect) {
++            super.init(frame: frame)
++            
++            self.backgroundLayer.masksToBounds = true
++            if #available(iOS 13.0, *) {
++                self.backgroundLayer.cornerCurve = .circular
++            }
++            self.layer.addSublayer(self.backgroundLayer)
++            
++            self.avatarsView.isUserInteractionEnabled = false
++            self.addSubview(self.avatarsView)
++            self.addSubview(self.ribbon)
++        }
++        
++        required init?(coder: NSCoder) {
++            fatalError("init(coder:) has not been implemented")
++        }
++        
++        func update(component: GiftBuyOrdersCellComponent, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
++            let previousComponent = self.component
++            self.component = component
++            
++            let size = CGSize(width: availableSize.width, height: 154.0)
++            let theme = component.theme
++            
++            // the grid's glass-style cell: corner 16 (GiftItemComponent, `.glass`)
++            self.backgroundLayer.backgroundColor = theme.list.itemBlocksBackgroundColor.cgColor
++            self.backgroundLayer.cornerRadius = 16.0
++            transition.setFrame(layer: self.backgroundLayer, frame: CGRect(origin: .zero, size: size))
++            
++            // the best buyers: 30-pt avatars, 20 apart, each cutting a 1.5-pt ring out of the next
++            let avatarSize = CGSize(width: 30.0, height: 30.0)
++            let avatarStep: CGFloat = 20.0
++            let peers = Array(component.peers.prefix(3))
++            let avatarsContent = self.avatarsContext.update(peers: peers, animated: previousComponent != nil)
++            let _ = self.avatarsView.update(
++                context: component.context,
++                content: avatarsContent,
++                itemSize: avatarSize,
++                customSpacing: avatarSize.width - avatarStep,
++                animation: transition.animation.isImmediate ? .None : .System(duration: 0.25, transition: ControlledTransition(duration: 0.25, curve: .easeInOut, interactive: false)),
++                synchronousLoad: true
++            )
++            let avatarsWidth = peers.isEmpty ? 0.0 : avatarSize.width + avatarStep * CGFloat(peers.count - 1)
++            transition.setFrame(view: self.avatarsView, frame: CGRect(origin: CGPoint(x: floorToScreenPixels((size.width - avatarsWidth) / 2.0), y: 20.0), size: CGSize(width: avatarsWidth, height: avatarSize.height)))
++            
++            let titleSize = self.title.update(
++                transition: .immediate,
++                component: AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: "Buy Orders", font: Font.semibold(14.0), textColor: theme.list.itemPrimaryTextColor)),
++                    horizontalAlignment: .center,
++                    maximumNumberOfLines: 1
++                )),
++                environment: {},
++                containerSize: CGSize(width: size.width - 12.0, height: 100.0)
++            )
++            if let titleView = self.title.view {
++                if titleView.superview == nil {
++                    titleView.isUserInteractionEnabled = false
++                    self.addSubview(titleView)
++                }
++                titleView.frame = CGRect(origin: CGPoint(x: floorToScreenPixels((size.width - titleSize.width) / 2.0), y: floorToScreenPixels(70.0 - titleSize.height / 2.0)), size: titleSize)
++            }
++            
++            let countString = component.count == 1 ? "1 order" : "\(presentationStringsFormattedNumber(Int32(clamping: component.count), component.groupingSeparator)) orders"
++            let subtitleSize = self.subtitle.update(
++                transition: .immediate,
++                component: AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: countString, font: Font.regular(12.0), textColor: theme.list.itemSecondaryTextColor)),
++                    horizontalAlignment: .center,
++                    maximumNumberOfLines: 1
++                )),
++                environment: {},
++                containerSize: CGSize(width: size.width - 12.0, height: 100.0)
++            )
++            if let subtitleView = self.subtitle.view {
++                if subtitleView.superview == nil {
++                    subtitleView.isUserInteractionEnabled = false
++                    self.addSubview(subtitleView)
++                }
++                subtitleView.frame = CGRect(origin: CGPoint(x: floorToScreenPixels((size.width - subtitleSize.width) / 2.0), y: floorToScreenPixels(88.0 - subtitleSize.height / 2.0)), size: subtitleSize)
++            }
++            
++            // the shop's Stars price capsule: #FFC83D at 20 %, the golden star, semibold 11 in #D3720A
++            // (GiftItemComponent, `.starGift` with a "#" price), 10 above the cell's bottom
++            if let bestStars = component.bestStars {
++                let priceSize = self.price.update(
++                    transition: .immediate,
++                    component: AnyComponent(StarsButtonContentComponent(
++                        context: component.context,
++                        text: "# \(presentationStringsFormattedNumber(bestStars, component.groupingSeparator))",
++                        color: theme.overallDarkAppearance ? UIColor(rgb: 0xffc337) : UIColor(rgb: 0xd3720a)
++                    )),
++                    environment: {},
++                    containerSize: size
++                )
++                if let priceView = self.price.view {
++                    if priceView.superview == nil {
++                        priceView.isUserInteractionEnabled = false
++                        self.addSubview(priceView)
++                    }
++                    priceView.isHidden = false
++                    priceView.frame = CGRect(origin: CGPoint(x: floorToScreenPixels((size.width - priceSize.width) / 2.0), y: size.height - priceSize.height - 10.0), size: priceSize)
++                }
++            } else {
++                self.price.view?.isHidden = true
++            }
++            
++            // the corner ribbon in the grid's blue (GiftItemComponent.Ribbon.Color.blue), 2 pt over the top and right edges
++            if self.ribbon.image == nil || previousComponent?.theme !== theme {
++                let colors: [UIColor]
++                if theme.overallDarkAppearance {
++                    colors = [UIColor(rgb: 0x142e42), UIColor(rgb: 0x354f5b)]
++                } else {
++                    colors = [UIColor(rgb: 0x34a4fc), UIColor(rgb: 0x6fd3ff)]
++                }
++                self.ribbon.image = generateGradientTintedImage(image: UIImage(bundleImageName: "Premium/GiftRibbon"), colors: colors, direction: .mirroredDiagonal)
++            }
++            let ribbonOffset = CGPoint(x: 2.0, y: -2.0)
++            if let ribbonImage = self.ribbon.image {
++                self.ribbon.frame = CGRect(origin: CGPoint(x: size.width - ribbonImage.size.width + ribbonOffset.x, y: ribbonOffset.y), size: ribbonImage.size)
++            }
++            let ribbonTextSize = self.ribbonText.update(
++                transition: .immediate,
++                component: AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: "orders", font: Font.semibold(10.0), textColor: .white)),
++                    horizontalAlignment: .center
++                )),
++                environment: {},
++                containerSize: size
++            )
++            if let ribbonTextView = self.ribbonText.view {
++                if ribbonTextView.superview == nil {
++                    ribbonTextView.isUserInteractionEnabled = false
++                    self.addSubview(ribbonTextView)
++                }
++                ribbonTextView.bounds = CGRect(origin: .zero, size: ribbonTextSize)
++                ribbonTextView.transform = CGAffineTransform(rotationAngle: .pi / 4.0)
++                ribbonTextView.center = CGPoint(x: size.width - 22.0 + ribbonOffset.x, y: 22.0 + ribbonOffset.y)
++            }
++            
++            return size
++        }
++    }
++    
++    func makeView() -> View {
++        return View(frame: CGRect())
++    }
++    
++    func update(view: View, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
++        return view.update(component: self, availableSize: availableSize, state: state, environment: environment, transition: transition)
++    }
++}
++
++/// The cell in the market's grid: it follows the collection's order book and opens the Buy Orders screen.
++final class GiftBuyOrdersGridItem {
++    let ordersContext: GiftBuyOrdersContext
++    
++    private let cell = ComponentView<Empty>()
++    private var ordersState: GiftBuyOrdersContext.State?
++    private var ordersDisposable: Disposable?
++    
++    private var theme: PresentationTheme?
++    private var groupingSeparator: String = ""
++    private var controller: (() -> ViewController?)?
++    private var size: CGSize?
++    
++    init(context: AccountContext, gift: StarGift.Gift, resaleGiftsContext: ResaleGiftsContext) {
++        self.ordersContext = GiftBuyOrdersContext(context: context, gift: gift, resaleGiftsContext: resaleGiftsContext)
++        
++        self.ordersDisposable = (self.ordersContext.state
++        |> deliverOnMainQueue).startStrict(next: { [weak self] state in
++            guard let self else {
++                return
++            }
++            let isFirstState = self.ordersState == nil
++            self.ordersState = state
++            self.updateCell(transition: isFirstState ? .immediate : .easeInOut(duration: 0.25))
++        })
++    }
++    
++    deinit {
++        self.ordersDisposable?.dispose()
++    }
++    
++    func update(containerView: UIView, belowView: UIView, frame: CGRect, theme: PresentationTheme, groupingSeparator: String, controller: @escaping () -> ViewController?, transition: ComponentTransition) {
++        self.theme = theme
++        self.groupingSeparator = groupingSeparator
++        self.controller = controller
++        self.size = frame.size
++        
++        self.updateCell(transition: .immediate)
++        
++        if let cellView = self.cell.view {
++            if cellView.superview == nil {
++                if belowView.superview === containerView {
++                    containerView.insertSubview(cellView, belowSubview: belowView)
++                } else {
++                    containerView.addSubview(cellView)
++                }
++            }
++            transition.setFrame(view: cellView, frame: frame)
++        }
++    }
++    
++    private func updateCell(transition: ComponentTransition) {
++        guard let theme = self.theme, let size = self.size else {
++            return
++        }
++        let orders = self.ordersState?.orders ?? []
++        let _ = self.cell.update(
++            transition: transition,
++            component: AnyComponent(PlainButtonComponent(
++                content: AnyComponent(GiftBuyOrdersCellComponent(
++                    context: self.ordersContext.context,
++                    theme: theme,
++                    peers: orders.prefix(3).map(\.peer),
++                    count: orders.count,
++                    bestStars: orders.first(where: { $0.amount.currency == .stars })?.amount.amount.value,
++                    groupingSeparator: self.groupingSeparator
++                )),
++                effectAlignment: .center,
++                action: { [weak self] in
++                    self?.openOrders()
++                },
++                animateAlpha: false
++            )),
++            environment: {},
++            containerSize: size
++        )
++    }
++    
++    private func openOrders() {
++        guard let controller = self.controller?() else {
++            return
++        }
++        controller.push(GiftBuyOrdersScreen(context: self.ordersContext.context, ordersContext: self.ordersContext))
++    }
++}
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/GiftBuyOrdersScreen.swift b/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/GiftBuyOrdersScreen.swift
+new file mode 100644
+index 0000000000..c746028ab4
+--- /dev/null
++++ b/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/GiftBuyOrdersScreen.swift
+@@ -0,0 +1,1142 @@
++import Foundation
++import UIKit
++import Display
++import ComponentFlow
++import SwiftSignalKit
++import TelegramCore
++import TelegramPresentationData
++import TelegramUIPreferences
++import AccountContext
++import AppBundle
++import ViewControllerComponent
++import MultilineTextComponent
++import ButtonComponent
++import ListSectionComponent
++import EdgeEffect
++import GlassBackgroundComponent
++import AvatarComponent
++import TelegramStringFormatting
++import PresentationDataUtils
++import UndoUI
++import GiftViewScreen
++import StarsWithdrawalScreen
++import BalanceNeededScreen
++
++// Buy Orders (concept): the order book of one collection, pushed from the first cell of its resale market inside the
++// same sheet. The market's top band (back, title, the collection's name, the balance), a card with the best order and
++// the two actions, Sell to the best order and Place Order, then every order, best first.
++
++/// An amount with its currency's icon: the golden star (`Premium/Stars/StarLarge`) or GRAM (`Ads/TonBig`), with an
++/// optional title before it ("Sell for ★ 112,000").
++final class GiftBuyOrderAmountComponent: Component {
++    let prefix: String?
++    let amount: CurrencyAmount
++    let font: UIFont
++    let color: UIColor
++    let iconSize: CGFloat
++    let dateTimeFormat: PresentationDateTimeFormat
++    
++    init(prefix: String? = nil, amount: CurrencyAmount, font: UIFont, color: UIColor, iconSize: CGFloat, dateTimeFormat: PresentationDateTimeFormat) {
++        self.prefix = prefix
++        self.amount = amount
++        self.font = font
++        self.color = color
++        self.iconSize = iconSize
++        self.dateTimeFormat = dateTimeFormat
++    }
++    
++    static func ==(lhs: GiftBuyOrderAmountComponent, rhs: GiftBuyOrderAmountComponent) -> Bool {
++        if lhs.prefix != rhs.prefix {
++            return false
++        }
++        if lhs.amount != rhs.amount {
++            return false
++        }
++        if lhs.font != rhs.font {
++            return false
++        }
++        if lhs.color != rhs.color {
++            return false
++        }
++        if lhs.iconSize != rhs.iconSize {
++            return false
++        }
++        if lhs.dateTimeFormat != rhs.dateTimeFormat {
++            return false
++        }
++        return true
++    }
++    
++    final class View: UIView {
++        private let prefixText = ComponentView<Empty>()
++        private let icon = UIImageView()
++        private let text = ComponentView<Empty>()
++        private var currency: CurrencyAmount.Currency?
++        
++        override init(frame: CGRect) {
++            super.init(frame: frame)
++            
++            self.addSubview(self.icon)
++        }
++        
++        required init?(coder: NSCoder) {
++            fatalError("init(coder:) has not been implemented")
++        }
++        
++        func update(component: GiftBuyOrderAmountComponent, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
++            let currency = component.amount.currency
++            if self.currency != currency {
++                self.currency = currency
++                switch currency {
++                case .stars:
++                    self.icon.image = UIImage(bundleImageName: "Premium/Stars/StarLarge")
++                case .ton:
++                    self.icon.image = generateTintedImage(image: UIImage(bundleImageName: "Ads/TonBig"), color: UIColor(rgb: 0x30a1f5))
++                }
++            }
++            
++            let amountString: String
++            let iconSize: CGSize
++            switch currency {
++            case .stars:
++                amountString = presentationStringsFormattedNumber(component.amount.amount.value, component.dateTimeFormat.groupingSeparator)
++                iconSize = CGSize(width: component.iconSize, height: component.iconSize)
++            case .ton:
++                amountString = formatTonAmountText(component.amount.amount.value, dateTimeFormat: component.dateTimeFormat)
++                iconSize = CGSize(width: floor(component.iconSize * 0.8), height: floor(component.iconSize * 0.8))
++            }
++            
++            var prefixSize = CGSize()
++            if let prefix = component.prefix {
++                prefixSize = self.prefixText.update(
++                    transition: .immediate,
++                    component: AnyComponent(MultilineTextComponent(
++                        text: .plain(NSAttributedString(string: prefix, font: component.font, textColor: component.color)),
++                        maximumNumberOfLines: 1
++                    )),
++                    environment: {},
++                    containerSize: availableSize
++                )
++            }
++            let textSize = self.text.update(
++                transition: .immediate,
++                component: AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: amountString, font: component.font, textColor: component.color)),
++                    maximumNumberOfLines: 1
++                )),
++                environment: {},
++                containerSize: availableSize
++            )
++            
++            let prefixSpacing: CGFloat = component.prefix != nil ? 5.0 : 0.0
++            let iconSpacing: CGFloat = max(2.0, floor(component.iconSize * 0.1))
++            let height = max(textSize.height, iconSize.height, prefixSize.height)
++            let size = CGSize(width: prefixSize.width + prefixSpacing + iconSize.width + iconSpacing + textSize.width, height: height)
++            
++            let textFrame = CGRect(origin: CGPoint(x: size.width - textSize.width, y: floorToScreenPixels((height - textSize.height) / 2.0)), size: textSize)
++            if let prefixView = self.prefixText.view {
++                if prefixView.superview == nil {
++                    self.addSubview(prefixView)
++                }
++                prefixView.isHidden = component.prefix == nil
++                prefixView.frame = CGRect(origin: CGPoint(x: 0.0, y: textFrame.minY), size: prefixSize)
++            }
++            // the icon sits on the digits' cap height
++            let capCenterY = textFrame.minY + component.font.ascender - component.font.capHeight / 2.0
++            self.icon.frame = CGRect(origin: CGPoint(x: prefixSize.width + prefixSpacing, y: floorToScreenPixels(capCenterY - iconSize.height / 2.0)), size: iconSize)
++            if let textView = self.text.view {
++                if textView.superview == nil {
++                    self.addSubview(textView)
++                }
++                textView.frame = textFrame
++            }
++            
++            return size
++        }
++    }
++    
++    func makeView() -> View {
++        return View(frame: CGRect())
++    }
++    
++    func update(view: View, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
++        return view.update(component: self, availableSize: availableSize, state: state, environment: environment, transition: transition)
++    }
++}
++
++/// The card at the top: "BEST ORDER", the best amount, how many orders are open, and two capsules side by side:
++/// Sell (to the best order that is not yours) and Place Order.
++private final class GiftBuyOrdersSummaryComponent: Component {
++    let theme: PresentationTheme
++    let dateTimeFormat: PresentationDateTimeFormat
++    let best: CurrencyAmount?
++    let count: Int
++    let sellAmount: Int64?
++    let sell: () -> Void
++    let placeOrder: () -> Void
++    
++    init(theme: PresentationTheme, dateTimeFormat: PresentationDateTimeFormat, best: CurrencyAmount?, count: Int, sellAmount: Int64?, sell: @escaping () -> Void, placeOrder: @escaping () -> Void) {
++        self.theme = theme
++        self.dateTimeFormat = dateTimeFormat
++        self.best = best
++        self.count = count
++        self.sellAmount = sellAmount
++        self.sell = sell
++        self.placeOrder = placeOrder
++    }
++    
++    static func ==(lhs: GiftBuyOrdersSummaryComponent, rhs: GiftBuyOrdersSummaryComponent) -> Bool {
++        if lhs.theme !== rhs.theme {
++            return false
++        }
++        if lhs.dateTimeFormat != rhs.dateTimeFormat {
++            return false
++        }
++        if lhs.best != rhs.best {
++            return false
++        }
++        if lhs.count != rhs.count {
++            return false
++        }
++        if lhs.sellAmount != rhs.sellAmount {
++            return false
++        }
++        return true
++    }
++    
++    final class View: UIView {
++        private let backgroundLayer = SimpleLayer()
++        private let label = ComponentView<Empty>()
++        private let best = ComponentView<Empty>()
++        private let count = ComponentView<Empty>()
++        private let sellButton = ComponentView<Empty>()
++        private let placeButton = ComponentView<Empty>()
++        
++        override init(frame: CGRect) {
++            super.init(frame: frame)
++            
++            self.backgroundLayer.cornerRadius = 26.0
++            self.layer.addSublayer(self.backgroundLayer)
++        }
++        
++        required init?(coder: NSCoder) {
++            fatalError("init(coder:) has not been implemented")
++        }
++        
++        func update(component: GiftBuyOrdersSummaryComponent, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
++            let theme = component.theme
++            let size = CGSize(width: availableSize.width, height: 168.0)
++            let sideInset: CGFloat = 20.0
++            
++            self.backgroundLayer.backgroundColor = theme.list.itemBlocksBackgroundColor.cgColor
++            self.backgroundLayer.frame = CGRect(origin: .zero, size: size)
++            
++            let labelSize = self.label.update(
++                transition: .immediate,
++                component: AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: "BEST ORDER", font: Font.regular(13.0), textColor: theme.list.freeTextColor))
++                )),
++                environment: {},
++                containerSize: CGSize(width: size.width - sideInset * 2.0, height: 100.0)
++            )
++            if let labelView = self.label.view {
++                if labelView.superview == nil {
++                    self.addSubview(labelView)
++                }
++                labelView.frame = CGRect(origin: CGPoint(x: sideInset, y: 16.0), size: labelSize)
++            }
++            
++            let bestComponent: AnyComponent<Empty>
++            if let best = component.best {
++                bestComponent = AnyComponent(GiftBuyOrderAmountComponent(amount: best, font: Font.with(size: 30.0, weight: .bold, traits: .monospacedNumbers), color: theme.list.itemPrimaryTextColor, iconSize: 31.0, dateTimeFormat: component.dateTimeFormat))
++            } else {
++                bestComponent = AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: "—", font: Font.bold(30.0), textColor: theme.list.itemSecondaryTextColor))
++                ))
++            }
++            let bestSize = self.best.update(
++                transition: .immediate,
++                component: bestComponent,
++                environment: {},
++                containerSize: CGSize(width: size.width - sideInset * 2.0, height: 100.0)
++            )
++            if let bestView = self.best.view {
++                if bestView.superview == nil {
++                    self.addSubview(bestView)
++                }
++                bestView.frame = CGRect(origin: CGPoint(x: sideInset, y: 34.0), size: bestSize)
++            }
++            
++            let countString = component.count == 1 ? "1 open order" : "\(presentationStringsFormattedNumber(Int32(clamping: component.count), component.dateTimeFormat.groupingSeparator)) open orders"
++            let countSize = self.count.update(
++                transition: .immediate,
++                component: AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: countString, font: Font.regular(15.0), textColor: theme.list.itemSecondaryTextColor))
++                )),
++                environment: {},
++                containerSize: CGSize(width: size.width - sideInset * 2.0, height: 100.0)
++            )
++            if let countView = self.count.view {
++                if countView.superview == nil {
++                    self.addSubview(countView)
++                }
++                countView.frame = CGRect(origin: CGPoint(x: sideInset, y: 74.0), size: countSize)
++            }
++            
++            // two 44-pt capsules, 10 apart: Sell in the accent colour on a 10 % tint, Place Order filled
++            let buttonSpacing: CGFloat = 10.0
++            let buttonWidth = floor((size.width - sideInset * 2.0 - buttonSpacing) / 2.0)
++            let buttonHeight: CGFloat = 44.0
++            let buttonY: CGFloat = 106.0
++            let accentColor = theme.list.itemAccentColor
++            
++            let sellContent: AnyComponentWithIdentity<Empty>
++            if let sellAmount = component.sellAmount {
++                sellContent = AnyComponentWithIdentity(id: AnyHashable(sellAmount), component: AnyComponent(GiftBuyOrderAmountComponent(
++                    prefix: "Sell for",
++                    amount: CurrencyAmount(amount: StarsAmount(value: sellAmount, nanos: 0), currency: .stars),
++                    font: Font.semibold(15.0),
++                    color: accentColor,
++                    iconSize: 17.0,
++                    dateTimeFormat: component.dateTimeFormat
++                )))
++            } else {
++                sellContent = AnyComponentWithIdentity(id: AnyHashable("sell"), component: AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: "Sell", font: Font.semibold(15.0), textColor: accentColor))
++                )))
++            }
++            let _ = self.sellButton.update(
++                transition: transition,
++                component: AnyComponent(ButtonComponent(
++                    background: ButtonComponent.Background(
++                        style: .legacy,
++                        color: accentColor.withMultipliedAlpha(0.1),
++                        foreground: accentColor,
++                        pressedColor: accentColor.withMultipliedAlpha(0.2),
++                        cornerRadius: buttonHeight / 2.0
++                    ),
++                    content: sellContent,
++                    isEnabled: component.sellAmount != nil,
++                    action: { [weak self] in
++                        guard let self, let component = self.component else {
++                            return
++                        }
++                        component.sell()
++                    }
++                )),
++                environment: {},
++                containerSize: CGSize(width: buttonWidth, height: buttonHeight)
++            )
++            if let sellButtonView = self.sellButton.view {
++                if sellButtonView.superview == nil {
++                    self.addSubview(sellButtonView)
++                }
++                sellButtonView.frame = CGRect(origin: CGPoint(x: sideInset, y: buttonY), size: CGSize(width: buttonWidth, height: buttonHeight))
++            }
++            
++            let _ = self.placeButton.update(
++                transition: transition,
++                component: AnyComponent(ButtonComponent(
++                    background: ButtonComponent.Background(
++                        style: .legacy,
++                        color: accentColor,
++                        foreground: theme.list.itemCheckColors.foregroundColor,
++                        pressedColor: accentColor.withMultipliedAlpha(0.9),
++                        cornerRadius: buttonHeight / 2.0
++                    ),
++                    content: AnyComponentWithIdentity(id: AnyHashable("place"), component: AnyComponent(MultilineTextComponent(
++                        text: .plain(NSAttributedString(string: "Place Order", font: Font.semibold(15.0), textColor: theme.list.itemCheckColors.foregroundColor))
++                    ))),
++                    action: { [weak self] in
++                        guard let self, let component = self.component else {
++                            return
++                        }
++                        component.placeOrder()
++                    }
++                )),
++                environment: {},
++                containerSize: CGSize(width: buttonWidth, height: buttonHeight)
++            )
++            if let placeButtonView = self.placeButton.view {
++                if placeButtonView.superview == nil {
++                    self.addSubview(placeButtonView)
++                }
++                placeButtonView.frame = CGRect(origin: CGPoint(x: size.width - sideInset - buttonWidth, y: buttonY), size: CGSize(width: buttonWidth, height: buttonHeight))
++            }
++            
++            self.component = component
++            
++            return size
++        }
++        
++        private var component: GiftBuyOrdersSummaryComponent?
++    }
++    
++    func makeView() -> View {
++        return View(frame: CGRect())
++    }
++    
++    func update(view: View, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
++        return view.update(component: self, availableSize: availableSize, state: state, environment: environment, transition: transition)
++    }
++}
++
++/// One order, 60 high, in the bidders' rows of the auction screen (`GiftAuctionBidScreen`): the place (1–3 on gold,
++/// silver and bronze circles, then plain numbers), the buyer's avatar, name and condition, the amount on the right.
++/// Your own order reads "You" on a light accent tint.
++private final class GiftBuyOrderRowComponent: Component {
++    let context: AccountContext
++    let theme: PresentationTheme
++    let strings: PresentationStrings
++    let nameDisplayOrder: PresentationPersonNameOrder
++    let dateTimeFormat: PresentationDateTimeFormat
++    let order: GiftBuyOrder
++    let place: Int
++    let action: (() -> Void)?
++    
++    init(context: AccountContext, theme: PresentationTheme, strings: PresentationStrings, nameDisplayOrder: PresentationPersonNameOrder, dateTimeFormat: PresentationDateTimeFormat, order: GiftBuyOrder, place: Int, action: (() -> Void)?) {
++        self.context = context
++        self.theme = theme
++        self.strings = strings
++        self.nameDisplayOrder = nameDisplayOrder
++        self.dateTimeFormat = dateTimeFormat
++        self.order = order
++        self.place = place
++        self.action = action
++    }
++    
++    static func ==(lhs: GiftBuyOrderRowComponent, rhs: GiftBuyOrderRowComponent) -> Bool {
++        if lhs.context !== rhs.context {
++            return false
++        }
++        if lhs.theme !== rhs.theme {
++            return false
++        }
++        if lhs.strings !== rhs.strings {
++            return false
++        }
++        if lhs.nameDisplayOrder != rhs.nameDisplayOrder {
++            return false
++        }
++        if lhs.dateTimeFormat != rhs.dateTimeFormat {
++            return false
++        }
++        if lhs.order != rhs.order {
++            return false
++        }
++        if lhs.place != rhs.place {
++            return false
++        }
++        if (lhs.action == nil) != (rhs.action == nil) {
++            return false
++        }
++        return true
++    }
++    
++    final class View: UIView, ListSectionComponentChildView {
++        var customUpdateIsHighlighted: ((Bool) -> Void)?
++        var enumerateSiblings: (((UIView) -> Void) -> Void)?
++        let separatorInset: CGFloat = 112.0
++        
++        private let tintLayer = SimpleLayer()
++        private let placeBackground = UIImageView()
++        private let placeText = ComponentView<Empty>()
++        private let avatar = ComponentView<Empty>()
++        private let name = ComponentView<Empty>()
++        private let condition = ComponentView<Empty>()
++        private let amount = ComponentView<Empty>()
++        private let button = HighlightTrackingButton()
++        
++        private var component: GiftBuyOrderRowComponent?
++        private var placeBackgroundPlace: Int?
++        
++        override init(frame: CGRect) {
++            super.init(frame: frame)
++            
++            self.layer.addSublayer(self.tintLayer)
++            self.addSubview(self.placeBackground)
++            self.addSubview(self.button)
++            
++            self.button.addTarget(self, action: #selector(self.pressed), for: .touchUpInside)
++            self.button.highligthedChanged = { [weak self] highlighted in
++                self?.customUpdateIsHighlighted?(highlighted)
++            }
++        }
++        
++        required init?(coder: NSCoder) {
++            fatalError("init(coder:) has not been implemented")
++        }
++        
++        @objc private func pressed() {
++            self.component?.action?()
++        }
++        
++        func update(component: GiftBuyOrderRowComponent, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
++            self.component = component
++            
++            let theme = component.theme
++            let order = component.order
++            let size = CGSize(width: availableSize.width, height: 60.0)
++            
++            self.tintLayer.backgroundColor = order.isMine ? theme.list.itemAccentColor.withMultipliedAlpha(0.07).cgColor : UIColor.clear.cgColor
++            self.tintLayer.frame = CGRect(origin: .zero, size: size)
++            
++            // the place: a 24-pt medal for 1–3 (GiftAuctionBidScreen's PeerPlaceComponent colours), then plain numbers,
++            // centred in a 40-pt column at x 12
++            let placeColumn = CGRect(x: 12.0, y: 0.0, width: 40.0, height: size.height)
++            let placeColors: [UIColor]?
++            switch component.place {
++            case 1:
++                placeColors = [UIColor(rgb: 0xffa901), UIColor(rgb: 0xffcd3b)]
++            case 2:
++                placeColors = [UIColor(rgb: 0x999999), UIColor(rgb: 0xbbbbbb)]
++            case 3:
++                placeColors = [UIColor(rgb: 0xcb692e), UIColor(rgb: 0xdc9a59)]
++            default:
++                placeColors = nil
++            }
++            let placeBackgroundSize = CGSize(width: 24.0, height: 24.0)
++            if let placeColors {
++                if self.placeBackgroundPlace != component.place {
++                    self.placeBackgroundPlace = component.place
++                    self.placeBackground.image = generateGradientFilledCircleImage(diameter: placeBackgroundSize.width, colors: placeColors.map { $0.cgColor } as NSArray, direction: .vertical)
++                }
++                self.placeBackground.isHidden = false
++            } else {
++                self.placeBackground.isHidden = true
++            }
++            self.placeBackground.frame = CGRect(origin: CGPoint(x: placeColumn.midX - placeBackgroundSize.width / 2.0, y: floorToScreenPixels((size.height - placeBackgroundSize.height) / 2.0)), size: placeBackgroundSize)
++            
++            let placeFont = placeColors != nil ? Font.with(size: 14.0, weight: .semibold, traits: .monospacedNumbers) : Font.with(size: 17.0, traits: .monospacedNumbers)
++            let placeSize = self.placeText.update(
++                transition: .immediate,
++                component: AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: presentationStringsFormattedNumber(Int32(clamping: component.place), component.dateTimeFormat.groupingSeparator), font: placeFont, textColor: placeColors != nil ? .white : theme.list.itemSecondaryTextColor))
++                )),
++                environment: {},
++                containerSize: CGSize(width: 60.0, height: 40.0)
++            )
++            if let placeView = self.placeText.view {
++                if placeView.superview == nil {
++                    placeView.isUserInteractionEnabled = false
++                    self.insertSubview(placeView, aboveSubview: self.placeBackground)
++                }
++                placeView.frame = CGRect(origin: CGPoint(x: floorToScreenPixels(placeColumn.midX - placeSize.width / 2.0), y: floorToScreenPixels((size.height - placeSize.height) / 2.0)), size: placeSize)
++            }
++            
++            let avatarSize = CGSize(width: 40.0, height: 40.0)
++            let _ = self.avatar.update(
++                transition: .immediate,
++                component: AnyComponent(AvatarComponent(
++                    context: component.context,
++                    theme: theme,
++                    peer: order.peer
++                )),
++                environment: {},
++                containerSize: avatarSize
++            )
++            if let avatarView = self.avatar.view {
++                if avatarView.superview == nil {
++                    avatarView.isUserInteractionEnabled = false
++                    self.insertSubview(avatarView, belowSubview: self.button)
++                }
++                avatarView.frame = CGRect(origin: CGPoint(x: 60.0, y: floorToScreenPixels((size.height - avatarSize.height) / 2.0)), size: avatarSize)
++            }
++            
++            let amountSize = self.amount.update(
++                transition: .immediate,
++                component: AnyComponent(GiftBuyOrderAmountComponent(
++                    amount: order.amount,
++                    font: Font.with(size: 15.0, weight: .semibold, traits: .monospacedNumbers),
++                    color: theme.list.itemPrimaryTextColor,
++                    iconSize: 17.0,
++                    dateTimeFormat: component.dateTimeFormat
++                )),
++                environment: {},
++                containerSize: CGSize(width: size.width, height: size.height)
++            )
++            if let amountView = self.amount.view {
++                if amountView.superview == nil {
++                    amountView.isUserInteractionEnabled = false
++                    self.insertSubview(amountView, belowSubview: self.button)
++                }
++                amountView.frame = CGRect(origin: CGPoint(x: size.width - 16.0 - amountSize.width, y: floorToScreenPixels((size.height - amountSize.height) / 2.0)), size: amountSize)
++            }
++            
++            let textX: CGFloat = 112.0
++            let textWidth = max(1.0, size.width - textX - amountSize.width - 16.0 - 8.0)
++            
++            let nameString = order.isMine ? "You" : order.peer.displayTitle(strings: component.strings, displayOrder: component.nameDisplayOrder)
++            let nameSize = self.name.update(
++                transition: .immediate,
++                component: AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: nameString, font: order.isMine ? Font.semibold(17.0) : Font.regular(17.0), textColor: theme.list.itemPrimaryTextColor)),
++                    maximumNumberOfLines: 1
++                )),
++                environment: {},
++                containerSize: CGSize(width: textWidth, height: 100.0)
++            )
++            if let nameView = self.name.view {
++                if nameView.superview == nil {
++                    nameView.isUserInteractionEnabled = false
++                    self.insertSubview(nameView, belowSubview: self.button)
++                }
++                nameView.frame = CGRect(origin: CGPoint(x: textX, y: 10.0), size: nameSize)
++            }
++            
++            let conditionSize = self.condition.update(
++                transition: .immediate,
++                component: AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: order.condition.title, font: Font.regular(13.0), textColor: theme.list.itemSecondaryTextColor)),
++                    maximumNumberOfLines: 1
++                )),
++                environment: {},
++                containerSize: CGSize(width: textWidth, height: 100.0)
++            )
++            if let conditionView = self.condition.view {
++                if conditionView.superview == nil {
++                    conditionView.isUserInteractionEnabled = false
++                    self.insertSubview(conditionView, belowSubview: self.button)
++                }
++                conditionView.frame = CGRect(origin: CGPoint(x: textX, y: 33.0), size: conditionSize)
++            }
++            
++            self.button.isEnabled = component.action != nil
++            self.button.frame = CGRect(origin: .zero, size: size)
++            
++            return size
++        }
++    }
++    
++    func makeView() -> View {
++        return View(frame: CGRect())
++    }
++    
++    func update(view: View, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
++        return view.update(component: self, availableSize: availableSize, state: state, environment: environment, transition: transition)
++    }
++}
++
++final class GiftBuyOrdersScreenComponent: Component {
++    typealias EnvironmentType = ViewControllerComponentContainer.Environment
++    
++    let context: AccountContext
++    let ordersContext: GiftBuyOrdersContext
++    let overNavigationContainer: UIView
++    
++    init(context: AccountContext, ordersContext: GiftBuyOrdersContext, overNavigationContainer: UIView) {
++        self.context = context
++        self.ordersContext = ordersContext
++        self.overNavigationContainer = overNavigationContainer
++    }
++    
++    static func ==(lhs: GiftBuyOrdersScreenComponent, rhs: GiftBuyOrdersScreenComponent) -> Bool {
++        if lhs.context !== rhs.context {
++            return false
++        }
++        if lhs.ordersContext !== rhs.ordersContext {
++            return false
++        }
++        return true
++    }
++    
++    private final class ScrollView: UIScrollView {
++        override func touchesShouldCancel(in view: UIView) -> Bool {
++            return true
++        }
++    }
++    
++    final class View: UIView {
++        private let scrollView: ScrollView
++        private let edgeEffectView: EdgeEffectView
++        
++        private let balance = ComponentView<Empty>()
++        private let balanceBackgroundView: GlassContextExtractableContainer
++        private let title = ComponentView<Empty>()
++        private let subtitle = ComponentView<Empty>()
++        
++        private let summary = ComponentView<Empty>()
++        private let list = ComponentView<Empty>()
++        
++        private var ordersState: GiftBuyOrdersContext.State?
++        private var ordersDisposable: Disposable?
++        
++        private var profileGiftsContext: ProfileGiftsContext?
++        private var ownGiftsDisposable: Disposable?
++        private var ownGifts: [StarGift.UniqueGift] = []
++        
++        private var component: GiftBuyOrdersScreenComponent?
++        private weak var state: EmptyComponentState?
++        private var environment: EnvironmentType?
++        private var isUpdating = false
++        
++        override init(frame: CGRect) {
++            self.balanceBackgroundView = GlassContextExtractableContainer()
++            
++            self.scrollView = ScrollView()
++            self.scrollView.showsVerticalScrollIndicator = true
++            self.scrollView.showsHorizontalScrollIndicator = false
++            self.scrollView.scrollsToTop = false
++            self.scrollView.delaysContentTouches = false
++            self.scrollView.canCancelContentTouches = true
++            self.scrollView.contentInsetAdjustmentBehavior = .never
++            if #available(iOS 13.0, *) {
++                self.scrollView.automaticallyAdjustsScrollIndicatorInsets = false
++            }
++            self.scrollView.alwaysBounceVertical = true
++            
++            self.edgeEffectView = EdgeEffectView()
++            
++            super.init(frame: frame)
++            
++            self.addSubview(self.scrollView)
++            self.addSubview(self.edgeEffectView)
++        }
++        
++        required init?(coder: NSCoder) {
++            fatalError("init(coder:) has not been implemented")
++        }
++        
++        deinit {
++            self.ordersDisposable?.dispose()
++            self.ownGiftsDisposable?.dispose()
++        }
++        
++        /// Your gifts of this collection: the Sell button sells the first one an order accepts.
++        private func loadOwnGifts(component: GiftBuyOrdersScreenComponent) {
++            let giftId = component.ordersContext.gift.id
++            let profileGiftsContext = ProfileGiftsContext(account: component.context.account, peerId: component.context.account.peerId, filter: [.unique, .displayed, .hidden])
++            self.profileGiftsContext = profileGiftsContext
++            self.ownGiftsDisposable = (profileGiftsContext.state
++            |> deliverOnMainQueue).startStrict(next: { [weak self] state in
++                guard let self else {
++                    return
++                }
++                var ownGifts: [StarGift.UniqueGift] = []
++                for gift in state.filteredGifts + state.gifts {
++                    if case let .unique(uniqueGift) = gift.gift, uniqueGift.giftId == giftId, !ownGifts.contains(where: { $0.slug == uniqueGift.slug }) {
++                        ownGifts.append(uniqueGift)
++                    }
++                }
++                if self.ownGifts != ownGifts {
++                    self.ownGifts = ownGifts
++                    if !self.isUpdating {
++                        self.state?.updated(transition: .easeInOut(duration: 0.2))
++                    }
++                }
++            })
++        }
++        
++        /// What the Sell button sells and to whom: your first gift of the collection that the best order you did not
++        /// place accepts. Without a gift of your own, the cheapest listing stands in, so that the flow can be tried.
++        private func sellTarget() -> (gift: StarGift.UniqueGift, order: GiftBuyOrder)? {
++            guard let component = self.component, let ordersState = self.ordersState else {
++                return nil
++            }
++            var gifts = self.ownGifts
++            if gifts.isEmpty, let listings = component.ordersContext.resaleGiftsContext.currentState?.gifts {
++                for gift in listings {
++                    if case let .unique(uniqueGift) = gift {
++                        gifts.append(uniqueGift)
++                        break
++                    }
++                }
++            }
++            for order in ordersState.orders where !order.isMine && order.amount.currency == .stars {
++                if let gift = gifts.first(where: { order.condition.matches($0) }) {
++                    return (gift, order)
++                }
++            }
++            return nil
++        }
++        
++        private func openPlaceOrder() {
++            guard let component = self.component, let controller = self.environment?.controller() else {
++                return
++            }
++            let ordersContext = component.ordersContext
++            let screen = StarsWithdrawScreen(context: component.context, mode: .starGiftBuyOrder(gift: ordersContext.gift, completion: { [weak self] amount, duration in
++                self?.commitOrder(amount: amount, duration: duration)
++            }))
++            controller.push(screen)
++        }
++        
++        /// Places the order once the balance covers it, the way an offer does: missing Stars are bought first.
++        private func commitOrder(amount: CurrencyAmount, duration: Int32) {
++            guard let component = self.component else {
++                return
++            }
++            let context = component.context
++            let ordersContext = component.ordersContext
++            let held = GiftBuyOrdersStorage.shared.currentHeldAmounts(accountPeerId: context.account.peerId)
++            
++            switch amount.currency {
++            case .stars:
++                let available = (context.starsContext?.currentState?.balance.value ?? 0) - held.stars
++                if let starsContext = context.starsContext, amount.amount.value > available {
++                    let requiredStars = amount.amount.value - available
++                    let _ = (context.engine.payments.starsTopUpOptions()
++                    |> take(1)
++                    |> deliverOnMainQueue).startStandalone(next: { [weak self] options in
++                        guard let self, let controller = self.environment?.controller() else {
++                            return
++                        }
++                        let purchaseController = context.sharedContext.makeStarsPurchaseScreen(
++                            context: context,
++                            starsContext: starsContext,
++                            options: options,
++                            purpose: .starGiftOffer(requiredStars: requiredStars),
++                            targetPeerId: nil,
++                            customTheme: nil,
++                            completion: { stars in
++                                starsContext.add(balance: StarsAmount(value: stars, nanos: 0))
++                                ordersContext.placeOrder(amount: amount, duration: duration)
++                            }
++                        )
++                        controller.push(purchaseController)
++                    })
++                    return
++                }
++            case .ton:
++                let available = (context.tonContext?.currentState?.balance.value ?? 0) - held.ton
++                if amount.amount.value > available {
++                    guard let controller = self.environment?.controller() else {
++                        return
++                    }
++                    var fragmentUrl = "https://fragment.com/ads/topup"
++                    if let data = context.currentAppConfiguration.with({ $0 }).data, let value = data["ton_topup_url"] as? String {
++                        fragmentUrl = value
++                    }
++                    controller.push(BalanceNeededScreen(
++                        context: context,
++                        amount: StarsAmount(value: amount.amount.value - max(0, available), nanos: 0),
++                        buttonAction: {
++                            context.sharedContext.applicationBindings.openUrl(fragmentUrl)
++                        }
++                    ))
++                    return
++                }
++            }
++            ordersContext.placeOrder(amount: amount, duration: duration)
++        }
++        
++        /// Telegram's accept-offer confirmation, with the order's buyer and price.
++        private func openSell() {
++            guard let component = self.component, let controller = self.environment?.controller(), let target = self.sellTarget() else {
++                return
++            }
++            let gift = target.gift
++            let order = target.order
++            let context = component.context
++            let ordersContext = component.ordersContext
++            let alertController = giftOfferAlertController(
++                context: context,
++                updatedPresentationData: nil,
++                gift: gift,
++                peer: order.peer,
++                amount: order.amount,
++                commit: { [weak self] in
++                    if case let .sample(index) = order.id {
++                        ordersContext.markSold(sampleIndex: index)
++                    }
++                    self?.presentSoldToast(gift: gift, order: order)
++                }
++            )
++            controller.present(alertController, in: .window(.root))
++        }
++        
++        private func presentSoldToast(gift: StarGift.UniqueGift, order: GiftBuyOrder) {
++            guard let component = self.component, let controller = self.environment?.controller() else {
++                return
++            }
++            let context = component.context
++            let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++            
++            var animationFile: TelegramMediaFile?
++            for attribute in gift.attributes {
++                if case let .model(_, file, _, _) = attribute {
++                    animationFile = file
++                    break
++                }
++            }
++            let buyerName = order.peer.displayTitle(strings: presentationData.strings, displayOrder: presentationData.nameDisplayOrder)
++            let amountString = presentationStringsFormattedNumber(order.amount.amount.value, presentationData.dateTimeFormat.groupingSeparator)
++            let text = "Sold to **\(buyerName)** for **\(amountString) Stars**."
++            
++            let content: UndoOverlayContent
++            if let animationFile {
++                content = .sticker(context: context, file: animationFile, loop: false, title: nil, text: text, undoText: nil, customAction: nil)
++            } else {
++                content = .image(image: UIImage(bundleImageName: "Premium/Stars/StarLarge") ?? UIImage(), title: nil, text: text, round: false, undoText: nil)
++            }
++            controller.present(UndoOverlayController(presentationData: presentationData, content: content, elevatedLayout: false, action: { _ in
++                return true
++            }), in: .current)
++        }
++        
++        /// Your own order: cancelling it gives its Stars back.
++        private func openCancel(order: GiftBuyOrder) {
++            guard let component = self.component, let controller = self.environment?.controller(), case let .mine(id) = order.id else {
++                return
++            }
++            let context = component.context
++            let ordersContext = component.ordersContext
++            let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++            
++            let amountString: String
++            let currencyName: String
++            switch order.amount.currency {
++            case .stars:
++                amountString = "\(presentationStringsFormattedNumber(order.amount.amount.value, presentationData.dateTimeFormat.groupingSeparator)) Stars"
++                currencyName = "Stars"
++            case .ton:
++                amountString = "\(formatTonAmountText(order.amount.amount.value, dateTimeFormat: presentationData.dateTimeFormat)) GRAM"
++                currencyName = "GRAM"
++            }
++            let giftTitle = ordersContext.gift.title ?? "gift"
++            let article = giftTitle.lowercased().first.flatMap({ "aeiou".contains($0) }) == true ? "an" : "a"
++            controller.present(textAlertController(
++                context: context,
++                title: "Cancel Order",
++                text: "Your order to buy \(article) \(giftTitle) for **\(amountString)** will be removed, and the \(currencyName) it holds will return to your balance.",
++                actions: [
++                    TextAlertAction(type: .genericAction, title: "Keep", action: {}),
++                    TextAlertAction(type: .destructiveAction, title: "Cancel Order", action: {
++                        ordersContext.cancelOrder(id: id)
++                    })
++                ],
++                parseMarkdown: true
++            ), in: .window(.root))
++        }
++        
++        func update(component: GiftBuyOrdersScreenComponent, availableSize: CGSize, state: EmptyComponentState, environment: Environment<EnvironmentType>, transition: ComponentTransition) -> CGSize {
++            self.isUpdating = true
++            defer {
++                self.isUpdating = false
++            }
++            
++            let environment = environment[EnvironmentType.self].value
++            let themeUpdated = self.environment?.theme !== environment.theme
++            self.environment = environment
++            self.state = state
++            
++            if self.component == nil {
++                self.ordersDisposable = (component.ordersContext.state
++                |> deliverOnMainQueue).startStrict(next: { [weak self] ordersState in
++                    guard let self else {
++                        return
++                    }
++                    let isFirstState = self.ordersState == nil
++                    self.ordersState = ordersState
++                    if !self.isUpdating {
++                        self.state?.updated(transition: isFirstState ? .immediate : .spring(duration: 0.4))
++                    }
++                })
++                self.loadOwnGifts(component: component)
++            }
++            self.component = component
++            
++            let theme = environment.theme
++            let strings = environment.strings
++            let presentationData = component.context.sharedContext.currentPresentationData.with { $0 }
++            
++            if themeUpdated {
++                self.backgroundColor = theme.list.blocksBackgroundColor
++            }
++            
++            // the market's top band: the same edge, balance, title and subtitle as `GiftStoreScreen` without filters
++            let edgeEffectFrame = CGRect(origin: .zero, size: CGSize(width: availableSize.width, height: environment.navigationHeight + 8.0))
++            transition.setFrame(view: self.edgeEffectView, frame: edgeEffectFrame)
++            self.edgeEffectView.update(content: theme.list.blocksBackgroundColor, blur: true, rect: edgeEffectFrame, edge: .top, edgeSize: min(30.0, edgeEffectFrame.height), transition: transition)
++            
++            let balanceSize = self.balance.update(
++                transition: .immediate,
++                component: AnyComponent(BalanceComponent(
++                    context: component.context,
++                    theme: theme,
++                    action: { [weak self] in
++                        guard let self, let component = self.component, let starsContext = component.context.starsContext, let controller = self.environment?.controller() else {
++                            return
++                        }
++                        controller.push(component.context.sharedContext.makeStarsTransactionsScreen(context: component.context, starsContext: starsContext))
++                    }
++                )),
++                environment: {},
++                containerSize: availableSize
++            )
++            if let balanceView = self.balance.view {
++                if balanceView.superview == nil {
++                    self.balanceBackgroundView.contentView.addSubview(balanceView)
++                }
++                balanceView.frame = CGRect(origin: .zero, size: balanceSize)
++                
++                let balanceBackgroundFrame = CGRect(origin: CGPoint(x: availableSize.width - environment.safeInsets.right - environment.navigationBarTrailingButtonsInset - 16.0 - balanceSize.width, y: environment.navigationHeight - 60.0 + 2.0 + floor((60.0 - 44.0) * 0.5)), size: balanceSize)
++                transition.setFrame(view: self.balanceBackgroundView, frame: balanceBackgroundFrame)
++                self.balanceBackgroundView.update(size: balanceBackgroundFrame.size, cornerRadius: balanceBackgroundFrame.height * 0.5, isDark: theme.overallDarkAppearance, tintColor: .init(kind: .panel), isInteractive: true, transition: transition)
++            }
++            if self.balanceBackgroundView.superview == nil {
++                component.overNavigationContainer.addSubview(self.balanceBackgroundView)
++            }
++            
++            var topInset: CGFloat = 0.0
++            if environment.statusBarHeight > 0.0 {
++                topInset = environment.statusBarHeight - 6.0
++            }
++            let headerSideInset: CGFloat = 24.0 + environment.safeInsets.left
++            
++            let titleSize = self.title.update(
++                transition: .immediate,
++                component: AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: "Buy Orders", font: Font.semibold(17.0), textColor: theme.rootController.navigationBar.primaryTextColor)),
++                    horizontalAlignment: .center
++                )),
++                environment: {},
++                containerSize: CGSize(width: availableSize.width - headerSideInset * 2.0, height: 100.0)
++            )
++            if let titleView = self.title.view {
++                if titleView.superview == nil {
++                    component.overNavigationContainer.addSubview(titleView)
++                }
++                transition.setFrame(view: titleView, frame: CGRect(origin: CGPoint(x: floor((availableSize.width - titleSize.width) / 2.0), y: topInset + 22.0), size: titleSize))
++            }
++            
++            let subtitleSize = self.subtitle.update(
++                transition: .immediate,
++                component: AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: component.ordersContext.gift.title ?? "Gift", font: Font.regular(13.0), textColor: theme.rootController.navigationBar.secondaryTextColor)),
++                    horizontalAlignment: .center,
++                    maximumNumberOfLines: 1
++                )),
++                environment: {},
++                containerSize: CGSize(width: availableSize.width - headerSideInset * 2.0, height: 100.0)
++            )
++            if let subtitleView = self.subtitle.view {
++                if subtitleView.superview == nil {
++                    component.overNavigationContainer.addSubview(subtitleView)
++                }
++                transition.setFrame(view: subtitleView, frame: CGRect(origin: CGPoint(x: floor((availableSize.width - subtitleSize.width) / 2.0), y: topInset + 43.0), size: subtitleSize))
++            }
++            
++            // the content: the summary card 10 under the band, the list 24 under it
++            let sideInset: CGFloat = 16.0 + environment.safeInsets.left
++            let contentWidth = availableSize.width - sideInset - 16.0 - environment.safeInsets.right
++            var contentHeight = environment.navigationHeight + 10.0
++            
++            let orders = self.ordersState?.orders ?? []
++            let sellTarget = self.sellTarget()
++            
++            let summarySize = self.summary.update(
++                transition: transition,
++                component: AnyComponent(GiftBuyOrdersSummaryComponent(
++                    theme: theme,
++                    dateTimeFormat: environment.dateTimeFormat,
++                    best: orders.first?.amount,
++                    count: orders.count,
++                    sellAmount: sellTarget?.order.amount.amount.value,
++                    sell: { [weak self] in
++                        self?.openSell()
++                    },
++                    placeOrder: { [weak self] in
++                        self?.openPlaceOrder()
++                    }
++                )),
++                environment: {},
++                containerSize: CGSize(width: contentWidth, height: 1000.0)
++            )
++            if let summaryView = self.summary.view {
++                if summaryView.superview == nil {
++                    self.scrollView.addSubview(summaryView)
++                }
++                transition.setFrame(view: summaryView, frame: CGRect(origin: CGPoint(x: sideInset, y: contentHeight), size: summarySize))
++            }
++            contentHeight += summarySize.height + 24.0
++            
++            var listItems: [AnyComponentWithIdentity<Empty>] = []
++            for (index, order) in orders.enumerated() {
++                listItems.append(AnyComponentWithIdentity(id: AnyHashable(order.id), component: AnyComponent(GiftBuyOrderRowComponent(
++                    context: component.context,
++                    theme: theme,
++                    strings: strings,
++                    nameDisplayOrder: presentationData.nameDisplayOrder,
++                    dateTimeFormat: environment.dateTimeFormat,
++                    order: order,
++                    place: index + 1,
++                    action: order.isMine ? { [weak self] in
++                        self?.openCancel(order: order)
++                    } : nil
++                ))))
++            }
++            let listSize = self.list.update(
++                transition: transition,
++                component: AnyComponent(ListSectionComponent(
++                    theme: theme,
++                    style: .glass,
++                    header: AnyComponent(MultilineTextComponent(
++                        text: .plain(NSAttributedString(string: "ALL ORDERS", font: Font.regular(presentationData.listsFontSize.itemListBaseHeaderFontSize), textColor: theme.list.freeTextColor)),
++                        maximumNumberOfLines: 0
++                    )),
++                    footer: nil,
++                    items: listItems
++                )),
++                environment: {},
++                containerSize: CGSize(width: contentWidth, height: 10000.0)
++            )
++            if let listView = self.list.view {
++                if listView.superview == nil {
++                    self.scrollView.addSubview(listView)
++                }
++                transition.setFrame(view: listView, frame: CGRect(origin: CGPoint(x: sideInset, y: contentHeight), size: listSize))
++            }
++            contentHeight += listSize.height
++            contentHeight += 24.0 + environment.safeInsets.bottom
++            
++            if self.scrollView.frame != CGRect(origin: .zero, size: availableSize) {
++                self.scrollView.frame = CGRect(origin: .zero, size: availableSize)
++            }
++            let contentSize = CGSize(width: availableSize.width, height: contentHeight)
++            if self.scrollView.contentSize != contentSize {
++                self.scrollView.contentSize = contentSize
++            }
++            let scrollInsets = UIEdgeInsets(top: environment.navigationHeight, left: 0.0, bottom: 0.0, right: 0.0)
++            if self.scrollView.verticalScrollIndicatorInsets != scrollInsets {
++                self.scrollView.verticalScrollIndicatorInsets = scrollInsets
++            }
++            
++            return availableSize
++        }
++    }
++    
++    func makeView() -> View {
++        return View()
++    }
++    
++    func update(view: View, availableSize: CGSize, state: EmptyComponentState, environment: Environment<EnvironmentType>, transition: ComponentTransition) -> CGSize {
++        return view.update(component: self, availableSize: availableSize, state: state, environment: environment, transition: transition)
++    }
++}
++
++/// Pushed over the market inside the same sheet, with the market's transparent glass bar (its back button returns).
++final class GiftBuyOrdersScreen: ViewControllerComponentContainer {
++    private let overNavigationContainer: UIView
++    
++    init(context: AccountContext, ordersContext: GiftBuyOrdersContext) {
++        let overNavigationContainer = SparseContainerView()
++        self.overNavigationContainer = overNavigationContainer
++        
++        super.init(context: context, component: GiftBuyOrdersScreenComponent(
++            context: context,
++            ordersContext: ordersContext,
++            overNavigationContainer: overNavigationContainer
++        ), navigationBarAppearance: .transparent, theme: .default, updatedPresentationData: nil)
++        
++        self.navigationItem.backBarButtonItem = UIBarButtonItem(title: context.sharedContext.currentPresentationData.with { $0 }.strings.Common_Back, style: .plain, target: nil, action: nil)
++        
++        if let navigationBar = self.navigationBar {
++            navigationBar.customOverBackgroundContentView.insertSubview(self.overNavigationContainer, at: 0)
++        }
++    }
++    
++    required init(coder aDecoder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++}
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/GiftStoreScreen.swift b/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/GiftStoreScreen.swift
+index 3b38b6d9c7..1fa8ada3a2 100644
+--- a/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/GiftStoreScreen.swift
++++ b/submodules/TelegramUI/Components/Gifts/GiftStoreScreen/Sources/GiftStoreScreen.swift
+@@ -120,6 +120,9 @@ public final class GiftStoreContentComponent: Component {
+         private var giftItems: [AnyHashable: ComponentView<Empty>] = [:]
+         private let filterSelector = ComponentView<Empty>()
+         
++        // Buy Orders (concept): the collection's order book, the first cell of the market
++        private var buyOrdersItem: GiftBuyOrdersGridItem?
++        
+         private var initialCount: Int32?
+         private var showLoading = true
+         
+@@ -196,6 +199,15 @@ public final class GiftStoreContentComponent: Component {
+                 
+                 let controller = component.controller
+                 
++                // Buy Orders (concept): on the market itself (not where crafting embeds the grid) the order book takes
++                // the first cell and the listings follow it
++                if !component.isPlain && !component.confirmPurchaseImmediately {
++                    let buyOrdersItem = self.buyOrdersItem ?? GiftBuyOrdersGridItem(context: component.context, gift: component.gift, resaleGiftsContext: component.resaleGiftsContext)
++                    self.buyOrdersItem = buyOrdersItem
++                    buyOrdersItem.update(containerView: self, belowView: self.loadingView, frame: itemFrame, theme: component.theme, groupingSeparator: component.dateTimeFormat.groupingSeparator, controller: controller, transition: transition)
++                    itemFrame.origin.x += itemFrame.width + optionSpacing
++                }
++                
+                 for gift in starGifts {
+                     guard case let .unique(uniqueGift) = gift else {
+                         continue
+@@ -1113,7 +1125,9 @@ public final class GiftStoreContentComponent: Component {
+             if let starGifts = self.starGiftsState?.gifts {
+                 let starsOptionSize = CGSize(width: optionWidth, height: 154.0)
+                 let optionSpacing: CGFloat = 10.0
+-                contentHeight += ceil(CGFloat(starGifts.count) / 3.0) * (starsOptionSize.height + optionSpacing)
++                // Buy Orders (concept): one more cell, the order book, before the listings
++                let buyOrdersCellCount = !component.isPlain && !component.confirmPurchaseImmediately ? 1 : 0
++                contentHeight += ceil(CGFloat(starGifts.count + buyOrdersCellCount) / 3.0) * (starsOptionSize.height + optionSpacing)
+                 contentHeight += -optionSpacing + 66.0
+             }
+             
+diff --git a/submodules/TelegramUI/Components/Stars/StarsWithdrawalScreen/Sources/StarsWithdrawalScreen.swift b/submodules/TelegramUI/Components/Stars/StarsWithdrawalScreen/Sources/StarsWithdrawalScreen.swift
+index 4edf945f26..0895c26fbc 100644
+--- a/submodules/TelegramUI/Components/Stars/StarsWithdrawalScreen/Sources/StarsWithdrawalScreen.swift
++++ b/submodules/TelegramUI/Components/Stars/StarsWithdrawalScreen/Sources/StarsWithdrawalScreen.swift
+@@ -225,6 +225,30 @@ private final class SheetContent: CombinedComponent {
+                 
+                 amountPlaceholder = environment.strings.Gift_Offer_PricePlaceholder
+                 
++                if let usdWithdrawRate = withdrawConfiguration.usdWithdrawRate, let tonUsdRate = withdrawConfiguration.tonUsdRate, let amount = state.amount, amount > StarsAmount.zero {
++                    switch state.currency {
++                    case .stars:
++                        let usdRate = Double(usdWithdrawRate) / 1000.0 / 100.0
++                        amountLabel = "~\(formatTonUsdValue(amount.value, divide: false, rate: usdRate, dateTimeFormat: environment.dateTimeFormat))"
++                    case .ton:
++                        let usdRate = Double(tonUsdRate) / 1000.0 / 1000000.0
++                        amountLabel = "~\(formatTonUsdValue(amount.value, divide: false, rate: usdRate, dateTimeFormat: environment.dateTimeFormat))"
++                    }
++                }
++            case .starGiftBuyOrder:
++                // Buy Orders (concept): the offer's limits and price field, with the order's words
++                titleString = "Buy Order"
++                amountTitle = "Price per Gift"
++                switch state.currency {
++                case .stars:
++                    minAmount = StarsAmount(value: resaleConfiguration.starGiftResaleMinStarsAmount, nanos: 0)
++                    maxAmount = StarsAmount(value: resaleConfiguration.starGiftResaleMaxStarsAmount, nanos: 0)
++                case .ton:
++                    minAmount = StarsAmount(value: resaleConfiguration.starGiftResaleMinTonAmount, nanos: 0)
++                    maxAmount = StarsAmount(value: resaleConfiguration.starGiftResaleMaxTonAmount, nanos: 0)
++                }
++                amountPlaceholder = environment.strings.Gift_Offer_PricePlaceholder
++                
+                 if let usdWithdrawRate = withdrawConfiguration.usdWithdrawRate, let tonUsdRate = withdrawConfiguration.tonUsdRate, let amount = state.amount, amount > StarsAmount.zero {
+                     switch state.currency {
+                     case .stars:
+@@ -318,6 +342,10 @@ private final class SheetContent: CombinedComponent {
+                 displayCurrencySelector = true
+                 starsTitle = environment.strings.Gift_Offer_OfferStars
+                 tonTitle = environment.strings.Gift_Offer_OfferTon
++            case .starGiftBuyOrder:
++                displayCurrencySelector = true
++                starsTitle = "Pay in Stars"
++                tonTitle = "Pay in GRAM"
+             default:
+                 starsTitle = ""
+                 tonTitle = ""
+@@ -520,6 +548,13 @@ private final class SheetContent: CombinedComponent {
+                     text: .plain(amountInfoString),
+                     maximumNumberOfLines: 0
+                 ))
++            case let .starGiftBuyOrder(gift, _):
++                let giftTitle = gift.title ?? "gift"
++                let article = giftTitle.lowercased().first.flatMap({ "aeiou".contains($0) }) == true ? "an" : "a"
++                amountFooter = AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: "Anyone who owns \(article) \(giftTitle) can sell it to you at this price right away.", font: amountFont, textColor: amountTextColor)),
++                    maximumNumberOfLines: 0
++                ))
+             default:
+                 amountFooter = nil
+             }
+@@ -756,18 +791,10 @@ private final class SheetContent: CombinedComponent {
+                     .cornerRadius(10.0)
+                 )
+                 contentSize.height += timestampSection.size.height
+-            } else if case let .starGiftOffer(peer, _, _) = component.mode {
++            } else if let durationTexts = giftDurationTexts(mode: component.mode, currency: state.currency, duration: state.duration, strings: environment.strings) {
+                 contentSize.height += 24.0
+                 
+-                let peerName = peer.compactDisplayTitle
+-                
+-                let footerString: String
+-                switch state.currency {
+-                case .stars:
+-                    footerString = environment.strings.Gift_Offer_DurationDescriptionStars(peerName).string
+-                case .ton:
+-                    footerString = environment.strings.Gift_Offer_DurationDescriptionTon(peerName).string
+-                }
++                let footerString = durationTexts.footer
+                 
+                 let periodFooterString = NSAttributedString(attributedString: parseMarkdownIntoAttributedString(footerString, attributes: amountMarkdownAttributes, textAlignment: .natural))
+                 let periodFooter = AnyComponent(MultilineTextComponent(
+@@ -792,7 +819,7 @@ private final class SheetContent: CombinedComponent {
+                                 title: AnyComponent(VStack([
+                                     AnyComponentWithIdentity(id: AnyHashable(0), component: AnyComponent(MultilineTextComponent(
+                                         text: .plain(NSAttributedString(
+-                                            string: environment.strings.Gift_Offer_Duration,
++                                            string: durationTexts.title,
+                                             font: Font.regular(presentationData.listsFontSize.baseDisplaySize),
+                                             textColor: environment.theme.list.itemPrimaryTextColor
+                                         )),
+@@ -892,6 +919,18 @@ private final class SheetContent: CombinedComponent {
+                 } else {
+                     buttonString = environment.strings.Gift_Offer_Offer
+                 }
++            } else if case .starGiftBuyOrder = component.mode {
++                // Buy Orders (concept): "Place Order  ★ 114,000", as the offer's "Offer  ★ 100"
++                if let amount = state.amount {
++                    switch state.currency {
++                    case .stars:
++                        buttonString = "Place Order  # \(presentationStringsFormattedNumber(amount, environment.dateTimeFormat.groupingSeparator))"
++                    case .ton:
++                        buttonString = "Place Order  $ \(formatTonAmountText(amount.value, dateTimeFormat: environment.dateTimeFormat, maxDecimalPositions: nil))"
++                    }
++                } else {
++                    buttonString = "Place Order"
++                }
+             } else if let amount = state.amount {
+                 buttonString = "\(environment.strings.Stars_Withdraw_Withdraw)  # \(presentationStringsFormattedNumber(amount, environment.dateTimeFormat.groupingSeparator))"
+             } else {
+@@ -1021,6 +1060,8 @@ private final class SheetContent: CombinedComponent {
+                                     completion(CurrencyAmount(amount: amount, currency: state.currency), state.timestamp)
+                                 case let .starGiftOffer(_, _, completion):
+                                     completion(CurrencyAmount(amount: amount, currency: state.currency), state.duration)
++                                case let .starGiftBuyOrder(_, completion):
++                                    completion(CurrencyAmount(amount: amount, currency: state.currency), state.duration)
+                                 }
+                                 
+                                 if dismiss {
+@@ -1151,7 +1192,7 @@ private final class SheetContent: CombinedComponent {
+                 currency = initialValue.currency
+                 amount = initialValue.amount
+                 self.timestamp = initialTimestamp
+-            case .starGiftOffer:
++            case .starGiftOffer, .starGiftBuyOrder:
+                 amount = nil
+             }
+             
+@@ -1276,6 +1317,13 @@ private final class StarsWithdrawSheetComponent: CombinedComponent {
+             
+             let controller = environment.controller
+             
++            // Buy Orders (concept): the order sheet spans the full width of the screen, without the 6-pt side margins of
++            // the glass sheet (which it keeps by itself only while it is taller than wide)
++            var sheetSize = context.availableSize
++            if case .starGiftBuyOrder = context.component.mode, !environment.presentsFloatingPanels, sheetSize.width < sheetSize.height, environment.safeInsets.left.isZero, environment.safeInsets.right.isZero {
++                sheetSize.width += 6.0 * 2.0
++            }
++            
+             let sheet = sheet.update(
+                 component: SheetComponent<EnvironmentType>(
+                     content: AnyComponent<EnvironmentType>(SheetContent(
+@@ -1324,7 +1372,7 @@ private final class StarsWithdrawSheetComponent: CombinedComponent {
+                         }
+                     )
+                 },
+-                availableSize: context.availableSize,
++                availableSize: sheetSize,
+                 transition: context.transition
+             )
+             
+@@ -1378,6 +1426,8 @@ public final class StarsWithdrawScreen: ViewControllerComponentContainer {
+         case paidMessages(current: Int64, minValue: Int64, fractionAfterCommission: Int, kind: StarsWithdrawalScreenSubject.PaidMessageKind, completion: (Int64) -> Void)
+         case suggestedPost(mode: SuggestedPostMode, price: CurrencyAmount, timestamp: Int32?, completion: (CurrencyAmount, Int32?) -> Void)
+         case starGiftOffer(peer: EnginePeer, gift: StarGift.UniqueGift, completion: (CurrencyAmount, Int32) -> Void)
++        /// Buy Orders (concept): the Offer to Buy sheet as an order for any gift of a collection.
++        case starGiftBuyOrder(gift: StarGift.Gift, completion: (CurrencyAmount, Int32) -> Void)
+     }
+     
+     private let context: AccountContext
+@@ -1457,6 +1507,13 @@ public final class StarsWithdrawScreen: ViewControllerComponentContainer {
+                 let amountString = formatTonAmountText(minAmount, dateTimeFormat: presentationData.dateTimeFormat, formatString: presentationData.strings.Currency_Grams)
+                 text = presentationData.strings.Gift_Offer_GiftMinAmountToast_Text(amountString).string
+             }
++        } else if case .starGiftBuyOrder = self.mode {
++            switch currency {
++            case .stars:
++                text = "An order cannot be lower than \(presentationData.strings.Stars_Withdraw_Withdraw_ErrorMinimum_Stars(Int32(clamping: minAmount)))."
++            case .ton:
++                text = "An order cannot be lower than \(formatTonAmountText(minAmount, dateTimeFormat: presentationData.dateTimeFormat, formatString: presentationData.strings.Currency_Grams))."
++            }
+         }
+         
+         let resultController = UndoOverlayController(
+@@ -2757,3 +2814,28 @@ private final class DurationMenuComponent: Component {
+         return view.update(component: self, availableSize: availableSize, state: state, environment: environment, transition: transition)
+     }
+ }
++
++/// The duration row's title and footer: an offer goes to one owner; Buy Orders (concept): an order waits for anyone
++/// who owns a gift of the collection.
++private func giftDurationTexts(mode: StarsWithdrawScreen.Mode, currency: CurrencyAmount.Currency, duration: Int32, strings: PresentationStrings) -> (title: String, footer: String)? {
++    switch mode {
++    case let .starGiftOffer(peer, _, _):
++        let peerName = peer.compactDisplayTitle
++        switch currency {
++        case .stars:
++            return (strings.Gift_Offer_Duration, strings.Gift_Offer_DurationDescriptionStars(peerName).string)
++        case .ton:
++            return (strings.Gift_Offer_Duration, strings.Gift_Offer_DurationDescriptionTon(peerName).string)
++        }
++    case .starGiftBuyOrder:
++        let hours = duration / 3600
++        switch currency {
++        case .stars:
++            return ("Order Duration", "Your Stars are held while the order is open and return to you if nobody sells within \(hours) hours.")
++        case .ton:
++            return ("Order Duration", "Your GRAM is held while the order is open and returns to you if nobody sells within \(hours) hours.")
++        }
++    default:
++        return nil
++    }
++}
